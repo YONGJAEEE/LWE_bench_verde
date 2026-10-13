@@ -307,11 +307,11 @@ class Evaluator(object):
 
             # 3 methods of testing for matching: mean, mode, and softmax mean
             pred_bin1 = np.vectorize(lambda x: 0 if x > np.mean(pred_final) else 1)(pred_final) 
-            # SciPy returns a scalar ``mode`` for a one-dimensional input when
-            # keepdims=False (the current default on supported versions).
-            # Avoid the legacy [0][0] indexing so CPU evaluation works across
-            # both old and new SciPy releases.
-            mode_value = np.asarray(stats.mode(pred_final, keepdims=False).mode).item()
+            # Do not pass ``keepdims``: older SciPy releases reject that
+            # keyword, while newer releases may return either a scalar or a
+            # one-element array.  Normalizing through ``reshape`` supports
+            # both APIs.
+            mode_value = np.asarray(stats.mode(pred_final).mode).reshape(-1)[0].item()
             pred_bin2 = np.vectorize(lambda x: 0 if x != mode_value else 1)(pred_final)
             pred_bin3 = np.vectorize(lambda x: 0 if x > np.mean(pred_softmax) else 1)(pred_softmax)
 
