@@ -373,7 +373,11 @@ class Evaluator(object):
         TransformerModel.STORE_OUTPUTS = True
 
         # iterator
-        ca_results = np.zeros(self.params.N), np.zeros(self.params.N)
+        # The CPU smoke-test configuration may use one decoder layer, while
+        # the original Verde configuration uses two.  Keep the evaluator
+        # aligned with the model instead of assuming exactly two layers.
+        num_ca_layers = len(decoder.layers)
+        ca_results = [np.zeros(self.params.N) for _ in range(num_ca_layers)]
         xe_loss = []
         for (x1, len1), (x2, len2), nb_ops in self.iterator:
             # target words to predict
@@ -401,15 +405,15 @@ class Evaluator(object):
             )
             xe_loss.append(loss.item())
 
-            for layerId in [0, 1]:
+            for layerId in range(num_ca_layers):
                 ca_scores = torch.stack(decoder.layers[layerId].cross_attention.outputs)
                 assert ca_scores.ndim == 5
                 guessed_idxs = self.guess_from_scores(ca_scores, 3)
                 for j in guessed_idxs:
                     ca_results[layerId][j] += 1
         
-        self.ca_results = ca_results[0] + ca_results[1]
-        for layerId in [0, 1]:
+        self.ca_results = np.sum(ca_results, axis=0)
+        for layerId in range(num_ca_layers):
             sorted_idx_by_count, indices = self.ordered_idx_from_scores(ca_results[layerId])
             self.secret_check.match_secret_iter(indices, sorted_idx_by_count, 'CA')
 
