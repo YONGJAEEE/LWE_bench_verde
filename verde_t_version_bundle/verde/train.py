@@ -234,6 +234,12 @@ def get_parser():
     # CPU / multi-gpu / multi-node
     parser.add_argument("--cpu", type=bool_flag, default=False,
                         help="Run on CPU")
+    parser.add_argument(
+        "--compile",
+        type=bool_flag,
+        default=False,
+        help="Compatibility flag accepted by the shared train launcher; Verde keeps eager execution.",
+    )
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Multi-GPU - Local rank")
     parser.add_argument("--master_port", type=int, default=-1,

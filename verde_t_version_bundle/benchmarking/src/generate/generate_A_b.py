@@ -102,6 +102,14 @@ def get_params():
         required=True,
         help="Directory to load the preprocessed data from.",
     )
+    parser.add_argument(
+        "--orig_A_path",
+        default="",
+        help=(
+            "Explicit path to the original A matrix. This avoids relying on "
+            "the working directory when params.pkl stores a relative path."
+        ),
+    )
     parser.add_argument("--secret_path", default="", help="Path to predefined secret.npy file.")
 
     # LWE
@@ -285,6 +293,23 @@ def init_tiny_A(nu=0, k=0):
 
 
 def generate(test_size=10000):
+    if params.N != 80:
+        raise ValueError(
+            "t-version generation requires N=80 (8-bit t prefix + 72-bit guess); "
+            f"got N={params.N}."
+        )
+    if not 0 <= params.min_hamming <= params.max_hamming <= 72:
+        raise ValueError(
+            "t-version hamming range must satisfy 0 <= min_hamming <= "
+            "max_hamming <= 72; "
+            f"got {params.min_hamming}..{params.max_hamming}."
+        )
+    if params.secret_type != "binary":
+        raise ValueError(
+            "t-version generation currently supports only binary secrets; "
+            f"got secret_type={params.secret_type!r}."
+        )
+
     if params.secret_type == "binary":
         secret_factory = BinaryFactory(sigma=params.sigma)
     elif params.secret_type == "ternary":
@@ -299,38 +324,65 @@ def generate(test_size=10000):
     h_range = range(params.min_hamming, params.max_hamming + 1)
     num_secrets = len(h_range) * params.num_secret_seeds
 
-    # s를 20개 모두 동일하게 만들고, s_0의 상위 8비트 중 하나에 1이 있도록 하드코딩
-    # s_0: 처음 8행 (0-7행 인덱스, 상위 8비트), s_1: 마지막 72행 (8-79행 인덱스, 하위 72비트)
-    # s_0의 6번째 비트(인덱스 6, t_6)에 1을 설정하고, 나머지는 0
-    # s_1은 hamming weight에 맞게 설정하되, 모든 시크릿에 대해 동일하게 유지
-    
+    # t-version secrets are constructed directly in the split used by the
+    # benchmark: t is fixed at index 6 and s_1 has exactly h nonzero entries
+    # in indices 8..79.  Generating an 80-dimensional hamming-h secret first
+    # and then deleting its prefix would make the effective s_1 weight random.
     if not os.path.isfile(params.secret_path):
-        logger.info("Creating %s secret (all %d secrets identical)", secret_factory.type_, num_secrets)
-        # 먼저 하나의 시크릿 생성
-        single_secret = secret_factory.new(
-            params.N, params.min_hamming, params.max_hamming, 1  # 1개만 생성
-        )
-        # s_0를 하드코딩: 6번째 비트(인덱스 6, t_6)에만 1
-        single_secret[:8, 0] = 0  # s_0 초기화
-        single_secret[6, 0] = 1  # 6번째 비트(t_6)에 1 설정
-        
-        # s_1은 원래 생성된 값 유지 (8:80)
-        # 모든 시크릿에 대해 동일하게 복사
         secret = np.zeros((params.N, num_secrets), dtype=np.int64)
-        for i in range(num_secrets):
-            secret[:, i] = single_secret[:, 0]
-        
-        logger.info("Created identical secrets: s_0[6]=1 (t_6), s_1 identical across all secrets")
+        guess_indices = np.arange(8, params.N)
+        for h in h_range:
+            for seed_id in range(params.num_secret_seeds):
+                column = (h - params.min_hamming) * params.num_secret_seeds + seed_id
+                chosen = rng.choice(guess_indices, size=h, replace=False)
+                secret[chosen, column] = 1
+        secret[6, :] = 1
+        logger.info(
+            "Created t-version secrets with t[6]=1 and exact s_1 weights "
+            "for h=%d..%d",
+            params.min_hamming,
+            params.max_hamming,
+        )
     else:
         logger.info("Loading secret from %s", params.secret_path)
-        secret = np.load(params.secret_path)
-        # 로드된 시크릿도 동일하게 만들기
-        if secret.shape[1] > 1:
-            logger.info("Making all %d secrets identical to first secret", secret.shape[1])
-            base_secret = secret[:, 0:1].copy()
-            secret = np.repeat(base_secret, secret.shape[1], axis=1)
-        # secret.npy에 이미 t_6이 정답으로 저장되어 있으므로 s_0를 그대로 사용
-        # s_0가 이미 올바르게 설정되어 있다고 가정 (t_6 = 인덱스 6에 1)
+        loaded_secret = np.asarray(np.load(params.secret_path), dtype=np.int64)
+        if loaded_secret.ndim == 1:
+            loaded_secret = loaded_secret[:, None]
+        if loaded_secret.ndim != 2 or loaded_secret.shape[0] not in (72, 80):
+            raise ValueError(
+                "t-version secret_path must contain a 72- or 80-row array; "
+                f"got shape {loaded_secret.shape}."
+            )
+        if loaded_secret.shape[0] == 72:
+            secret = np.zeros((80, loaded_secret.shape[1]), dtype=np.int64)
+            secret[8:, :] = loaded_secret
+        else:
+            secret = loaded_secret.copy()
+        if secret.shape[1] == 1 and num_secrets > 1:
+            secret = np.repeat(secret, num_secrets, axis=1)
+        if secret.shape != (80, num_secrets):
+            raise ValueError(
+                "t-version secret_path has the wrong number of secrets; "
+                f"expected {(80, num_secrets)}, got {secret.shape}."
+            )
+        secret[:8, :] = 0
+        secret[6, :] = 1
+
+    s1_weights = np.count_nonzero(secret[8:, :], axis=0)
+    expected_weights = np.repeat(
+        np.arange(params.min_hamming, params.max_hamming + 1),
+        params.num_secret_seeds,
+    )
+    if np.any((s1_weights < 0) | (s1_weights > 72)):
+        raise ValueError(
+            "s_1 hamming weight must be in the range 0..72; "
+            f"got {s1_weights.tolist()}."
+        )
+    if not np.array_equal(s1_weights, expected_weights):
+        raise ValueError(
+            "t-version secret construction produced unexpected s_1 hamming "
+            f"weights: expected {expected_weights.tolist()}, got {s1_weights.tolist()}."
+        )
 
     # s를 s_0 (8행)와 s_1 (72행)로 분리
     # s는 80행 num_secrets열 형태 (N=80, num_secrets=20)
@@ -338,7 +390,8 @@ def generate(test_size=10000):
     s_1 = secret[8:80, :]  # (72, num_secrets)
     logger.info("Secret split into s_0 (8x%d) and s_1 (72x%d)", num_secrets, num_secrets)
     logger.info("s_0: %s (should have 1 at index 6, t_6)", s_0[:, 0])
-    logger.info("s_1 hamming weight: %d", np.count_nonzero(s_1[:, 0]))
+    logger.info("s_1 hamming weight: %d", int(np.count_nonzero(s_1[:, 0])))
+    logger.info("full secret hamming weight: %d", int(np.count_nonzero(secret[:, 0])))
 
     tiny_A, col_permutation = init_tiny_A(nu = params.nu, k=params.rlwe)
 
@@ -568,11 +621,15 @@ def generate(test_size=10000):
         test_modified_Rb = modified_full_Rb[:test_size]
         train_modified_Rb = modified_full_Rb[test_size:]
 
-        # params.pkl과 params.json 저장 (각 버전별)
+        # params.pkl과 params.json 저장 (각 버전별).  Keep the actual t
+        # version in the dataset metadata so Verde can reassemble the fixed
+        # prefix during recovery.
+        version_params = vars(params).copy()
+        version_params["t_version"] = t_version
         with open(os.path.join(version_secret_dir, "params.pkl"), "wb") as fd:
-            pickle.dump(vars(params), fd)
+            pickle.dump(version_params, fd)
         with open(os.path.join(version_secret_dir, "params.json"), "w") as fd:
-            json.dump(vars(params), fd)
+            json.dump(version_params, fd)
 
         # 파일 저장
         # orig_A, orig_b는 검증용으로 원본 그대로 유지
@@ -774,6 +831,32 @@ def get_loaded_params():
     return loaded_params
 
 
+def resolve_orig_A_path(raw_path):
+    """Resolve an original-A path independently of the process cwd."""
+    raw_path = os.path.expanduser(str(raw_path))
+    candidates = []
+    if os.path.isabs(raw_path):
+        candidates.append(raw_path)
+    else:
+        candidates.extend(
+            [
+                os.path.abspath(raw_path),
+                os.path.abspath(os.path.join(params.processed_dump_path, raw_path)),
+                os.path.abspath(
+                    os.path.join(os.path.dirname(params.processed_dump_path), raw_path)
+                ),
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "../..", raw_path)),
+            ]
+        )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "Could not resolve the original A matrix path. "
+        f"Configured path={raw_path!r}; checked:\n" + "\n".join(candidates)
+    )
+
+
 if __name__ == "__main__":
     params = get_params()
     if params.seed < 0:
@@ -853,10 +936,13 @@ if __name__ == "__main__":
     else:
         params.m = loaded_params["m"]
 
-    if "reload_data" in loaded_params:
-        params.orig_A_path = loaded_params["reload_data"]
-    else:
-        params.orig_A_path = loaded_params["orig_A_path"]
+    configured_orig_A = params.orig_A_path
+    if not configured_orig_A:
+        if "reload_data" in loaded_params:
+            configured_orig_A = loaded_params["reload_data"]
+        else:
+            configured_orig_A = loaded_params["orig_A_path"]
+    params.orig_A_path = resolve_orig_A_path(configured_orig_A)
 
 
     if "secrets" in params.actions:

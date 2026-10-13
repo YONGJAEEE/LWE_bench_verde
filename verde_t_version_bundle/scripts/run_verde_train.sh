@@ -7,11 +7,18 @@ if [[ $# -lt 2 ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERDE_ROOT="$(cd "$SCRIPT_DIR/../verde" && pwd)"
+BUNDLE="${BUNDLE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+VERDE_ROOT="${BUNDLE}/verde"
 DATASET_DIR="$1"
 T_VERSION="$2"
-PYTHON_BIN="${PYTHON:-python}"
+PYTHON_BIN="${PYTHON:-$(command -v python || true)}"
 shift 2
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  echo "No active Python found; set PYTHON or activate a Python environment." >&2
+  exit 127
+fi
+export BUNDLE PYTHON="$PYTHON_BIN"
 
 DATASET_HAMMING="$("$PYTHON_BIN" - "$DATASET_DIR" <<'PY'
 import pickle
