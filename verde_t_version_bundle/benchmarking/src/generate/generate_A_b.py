@@ -238,40 +238,136 @@ def circulate_mlwe_A(A, n, k):
     return A
 
 def data_check(batch_RA, batch_Rb, secret, rlwe=0):
-    """Will return False if it finds that stdev is bad"""
-    # Skip file if (RA @ s - Rb) % Q is not significantly better.
-    if (
-        rlwe
-    ):  # because indexing is different for RLWE, must generate circulant matrices to check.
-        N, k = batch_RA.shape[1], rlwe
-        n = N // k
-        batch_RA = circulate_mlwe_A(batch_RA, n, k) % params.Q
-        batch_Rb = batch_Rb.reshape((-1, batch_Rb.shape[-1]))
+    """Validate one reduced batch before adding it to the training corpus.
 
-    bad_err_std = (
-        centered((batch_RA @ secret[:, 1:] - batch_Rb[:, :-1]) % params.Q, params.Q).std()
-        / params.Q
-    )
-    good_err_std = (
-        centered((batch_RA @ secret - batch_Rb) % params.Q, params.Q).std() / params.Q
-    )
-    logger.info("Good err std: %f \t Bad err std: %f", good_err_std, bad_err_std)
+    ``secret`` and ``batch_Rb`` are column-wise for LWE.  The old
+    implementation compared ``secret[:, 1:]`` with ``batch_Rb[:, :-1]``;
+    that produces empty arrays for a single secret and also hides malformed
+    input.  A multi-secret batch now uses a shifted secret/b pair as the
+    contrast.  A single-secret batch uses a non-trivial row permutation of
+    ``b`` instead.  If there are not enough distinct samples for a contrast,
+    the contrast is reported as inconclusive and the structural/reduction
+    checks still decide whether the batch is usable.
+    """
 
-    if good_err_std + 0.005 >= bad_err_std:
+    def result(accepted, reason, **values):
+        details = {"accepted": bool(accepted), "reason": reason}
+        details.update(values)
+        data_check.last_result = details
+        return bool(accepted)
+
+    q = getattr(params, "Q", None)
+    if not isinstance(q, (int, np.integer)) or q <= 1:
+        return result(False, "invalid_modulus")
+
+    try:
+        ra = np.asarray(batch_RA)
+        rb = np.asarray(batch_Rb)
+        s = np.asarray(secret)
+    except Exception as exc:
+        return result(False, "array_conversion", error=str(exc))
+
+    if ra.ndim != 2:
+        return result(False, "invalid_RA_shape", shape=ra.shape)
+    if rb.ndim not in (1, 2, 3):
+        return result(False, "invalid_Rb_shape", shape=rb.shape)
+    if s.ndim not in (1, 2):
+        return result(False, "invalid_secret_shape", shape=s.shape)
+
+    # MLWE stores b as (rows, n, secrets), while the generated circulant A
+    # has n times as many rows.  Convert both sides before common checks.
+    try:
+        if rlwe:
+            if ra.shape[1] % int(rlwe) != 0 or rb.ndim != 3:
+                return result(False, "invalid_RLWE_shape", ra_shape=ra.shape, rb_shape=rb.shape)
+            n, k = ra.shape[1] // int(rlwe), int(rlwe)
+            ra = circulate_mlwe_A(ra, n, k) % q
+            rb = rb.reshape((-1, rb.shape[-1]))
+        else:
+            if rb.ndim == 3:
+                return result(False, "unexpected_RLWE_b_shape", rb_shape=rb.shape)
+            rb = rb.reshape((-1, 1)) if rb.ndim == 1 else rb
+        s = s.reshape((-1, 1)) if s.ndim == 1 else s
+    except (TypeError, ValueError, IndexError) as exc:
+        return result(False, "shape_conversion", error=str(exc))
+
+    if ra.shape[0] == 0 or ra.shape[1] == 0 or rb.shape[0] == 0 or s.shape[1] == 0:
+        return result(False, "empty_array")
+    if ra.shape[0] != rb.shape[0]:
+        return result(False, "row_count_mismatch", ra_shape=ra.shape, rb_shape=rb.shape)
+    if ra.shape[1] != s.shape[0]:
+        return result(False, "secret_dimension_mismatch", ra_shape=ra.shape, secret_shape=s.shape)
+    if rb.shape[1] != s.shape[1]:
+        return result(False, "secret_count_mismatch", rb_shape=rb.shape, secret_shape=s.shape)
+
+    for name, array in (("batch_RA", ra), ("batch_Rb", rb), ("secret", s)):
+        if np.issubdtype(array.dtype, np.bool_) or not np.issubdtype(array.dtype, np.integer):
+            return result(False, f"{name}_not_integer", dtype=str(array.dtype))
+        if not np.all(np.isfinite(array)):
+            return result(False, f"{name}_not_finite")
+    if np.any((ra < 0) | (ra >= q)) or np.any((rb < 0) | (rb >= q)):
+        return result(False, "modular_value_out_of_range")
+
+    good_residual = centered((ra @ s - rb) % q, q)
+    good_err_std = float(good_residual.std() / q)
+    reduction_std = float(np.sqrt(12) * centered(ra, q).std() / q)
+    if not np.isfinite(good_err_std) or not np.isfinite(reduction_std):
+        return result(False, "non_finite_statistics")
+
+    # Use a shifted secret/b pair when there are multiple secrets.  For one
+    # secret, shuffle b across equations without relying on secret[:, 1:].
+    bad_err_std = None
+    contrast_reason = "not_checked"
+    if good_residual.size < 2:
+        contrast_reason = "insufficient_residual_samples"
+    elif s.shape[1] > 1:
+        bad_residual = centered((ra @ s[:, 1:] - rb[:, :-1]) % q, q)
+        bad_err_std = float(bad_residual.std() / q)
+        contrast_reason = "shifted_secret_columns"
+    else:
+        permutation = np.roll(np.arange(rb.shape[0]), 1)
+        if np.array_equal(rb, rb[permutation]):
+            contrast_reason = "shuffled_b_would_be_identical"
+        else:
+            bad_residual = centered((ra @ s - rb[permutation]) % q, q)
+            bad_err_std = float(bad_residual.std() / q)
+            contrast_reason = "shuffled_b_rows"
+
+    logger.info(
+        "Good residual std: %.6f; Bad residual std: %s; Centered reduction: %.6f (%s)",
+        good_err_std,
+        "not checked" if bad_err_std is None else f"{bad_err_std:.6f}",
+        reduction_std,
+        contrast_reason,
+    )
+
+    if reduction_std > float(params.write_threshold):
+        logger.warning("RA above reduction threshold. [std: %.6f, threshold: %.6f]", reduction_std, params.write_threshold)
+        return result(False, "reduction_above_write_threshold", reduction_std=reduction_std,
+                      good_err_std=good_err_std, bad_err_std=bad_err_std,
+                      contrast_reason=contrast_reason)
+    if bad_err_std is not None and not np.isfinite(bad_err_std):
+        return result(False, "non_finite_contrast_statistics", reduction_std=reduction_std,
+                      good_err_std=good_err_std, bad_err_std=bad_err_std,
+                      contrast_reason=contrast_reason)
+    if bad_err_std is not None and not good_err_std < bad_err_std:
         logger.warning(
-            "Err std too close to random. [err: %.3f, random: %.3f]",
+            "Good residual is not separated from contrast. [good: %.6f, bad: %.6f]",
             good_err_std,
             bad_err_std,
         )
-        return False
+        return result(False, "residual_not_separated", reduction_std=reduction_std,
+                      good_err_std=good_err_std, bad_err_std=bad_err_std,
+                      contrast_reason=contrast_reason)
 
-    # skip file if stddev is above write threshold.
-    std = np.sqrt(12) * centered(batch_RA, params.Q).std() / params.Q
-    # logger.warning('RA std is %.3f', std)
-    if std > params.write_threshold:
-        logger.warning("RA above reduction threshold. [std: %.3f]", std)
-        return False
-    return True
+    if bad_err_std is None:
+        logger.warning("Residual contrast not checked: %s", contrast_reason)
+    return result(True, "accepted", reduction_std=reduction_std,
+                  good_err_std=good_err_std, bad_err_std=bad_err_std,
+                  contrast_reason=contrast_reason)
+
+
+data_check.last_result = {"accepted": False, "reason": "not_run"}
 
 
 def init_tiny_A(nu=0, k=0):
@@ -449,6 +545,12 @@ def generate(test_size=10000):
     logger.info("Loading data from %s", data_prefix_path)
 
     n_matrices, n_pairs = 0, 0
+    quality_stats = {
+        "checked": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "reasons": {},
+    }
 
     for A, R in read(data_prefix_path, params.m):
         # Remove any rows of R that are all zeros
@@ -478,10 +580,18 @@ def generate(test_size=10000):
         batch_Rb = mod_mult_torch(R, b, params.Q)
         assert batch_Rb.dtype == np.int64, (batch_Rb.dtype, batch_Rb[0][0])
     
-        if True: #data_check(batch_RA, batch_Rb, secret, params.rlwe):
+        quality_stats["checked"] += 1
+        accepted = data_check(batch_RA, batch_Rb, secret, params.rlwe)
+        check_reason = data_check.last_result.get("reason", "unknown")
+        if accepted:
+            quality_stats["accepted"] += 1
             full_RA[n_pairs:end] = batch_RA
             full_Rb[n_pairs:end] = batch_Rb
         else:
+            quality_stats["rejected"] += 1
+            quality_stats["reasons"][check_reason] = (
+                quality_stats["reasons"].get(check_reason, 0) + 1
+            )
             logger.debug("Error too large, ignoring this R")
             continue
         
@@ -503,6 +613,27 @@ def generate(test_size=10000):
     # Truncate arrays to n_pairs
     full_RA = full_RA[:n_pairs]
     full_Rb = full_Rb[:n_pairs]
+
+    logger.info(
+        "Data quality check: checked=%d, accepted=%d, rejected=%d, reasons=%s",
+        quality_stats["checked"],
+        quality_stats["accepted"],
+        quality_stats["rejected"],
+        quality_stats["reasons"] or "none",
+    )
+    if n_pairs == 0:
+        raise RuntimeError(
+            "No training samples survived data quality checks. "
+            f"checked={quality_stats['checked']}, reasons={quality_stats['reasons'] or 'none'}"
+        )
+    if n_pairs <= test_size:
+        raise RuntimeError(
+            "Insufficient learning samples after the train/test split: "
+            f"usable={n_pairs}, test_size={test_size}, train={max(0, n_pairs - test_size)}; "
+            f"quality={quality_stats}"
+        )
+    logger.info("Final learning sample count: %d (test=%d, train=%d)",
+                n_pairs, test_size, n_pairs - test_size)
 
     if params.rlwe:
         # Need at least N samples for RLWE in order to have a full circulant.

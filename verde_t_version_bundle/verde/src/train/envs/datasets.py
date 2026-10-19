@@ -16,6 +16,10 @@ from logging import getLogger
 logger = getLogger()
 
 
+T_VERSION_COUNT = 8
+T_VERSION_ACTUAL = 6
+
+
 class EnvDataset(Dataset):
     def __init__(self, params, env, datatype):
         super().__init__()
@@ -61,8 +65,21 @@ class EnvDataset(Dataset):
         # load the original tiny dataset if available
         self.orig_A, self.orig_b = None, None
         if os.path.isfile(os.path.join(params.reload_data, 'orig_A.npy')):
-            self.orig_A = np.load(os.path.join(params.reload_data, 'orig_A.npy'))
-            self.orig_b = np.load(os.path.join(params.reload_data, 'orig_b.npy'))[:, self.secret_col]
+            self.orig_A = np.asarray(np.load(os.path.join(params.reload_data, 'orig_A.npy')))
+            raw_orig_b = np.asarray(np.load(os.path.join(params.reload_data, 'orig_b.npy')))
+            if self.orig_A.ndim != 2:
+                raise ValueError(f'orig_A must be a 2-D integer array; got {self.orig_A.shape}.')
+            if raw_orig_b.ndim == 1:
+                raw_orig_b = raw_orig_b.reshape(-1, 1)
+            if raw_orig_b.ndim != 2 or self.secret_col < 0 or self.secret_col >= raw_orig_b.shape[1]:
+                raise ValueError(
+                    f'orig_b must have secret column {self.secret_col}; got shape {raw_orig_b.shape}.'
+                )
+            if raw_orig_b.shape[0] != self.orig_A.shape[0]:
+                raise ValueError(
+                    f'orig_A/orig_b row mismatch: {self.orig_A.shape[0]} vs {raw_orig_b.shape[0]}.'
+                )
+            self.orig_b = raw_orig_b[:, self.secret_col]
             if self.data_cols is not None:
                 if len(self.dense_cols) > 0:
                     self.orig_b -= np.sum(self.orig_A[:, self.dense_cols], axis=1)
@@ -70,20 +87,36 @@ class EnvDataset(Dataset):
                     self.orig_A[:, self.dense_cols] *= -1
                     self.orig_A[:, self.dense_cols] %= params.Q
                 self.orig_A = self.orig_A[:, self.data_cols]
-            # Sanity check to ensure we loaded the correct dataset.  With a
-            # t-versioned secret, the stored secret contains the model guess
-            # and the fixed 8-bit prefix must be assembled first.
-            secret_for_check = params.secret
+
+            for name, array in (('orig_A', self.orig_A), ('orig_b', self.orig_b)):
+                if np.issubdtype(array.dtype, np.bool_) or not np.issubdtype(array.dtype, np.integer):
+                    raise ValueError(f'{name} must be an integer array; got {array.dtype}.')
+                if not np.all(np.isfinite(array)):
+                    raise ValueError(f'{name} contains NaN or Inf.')
+                if np.any((array < 0) | (array >= params.Q)):
+                    raise ValueError(f'{name} contains values outside [0, Q).')
+            if self.orig_A.shape[1] != params.N:
+                raise ValueError(
+                    f'orig_A has {self.orig_A.shape[1]} columns but params.N={params.N}.'
+                )
+
+            secret_for_check = np.asarray(params.secret).reshape(-1)
+            if np.issubdtype(secret_for_check.dtype, np.bool_) or not np.issubdtype(secret_for_check.dtype, np.integer):
+                raise ValueError(f'secret must be an integer vector; got {secret_for_check.dtype}.')
+            if not np.all(np.isfinite(secret_for_check)):
+                raise ValueError('secret contains NaN or Inf.')
             t_version = getattr(params, 't_version', -1)
+            if isinstance(t_version, bool) or not isinstance(t_version, (int, np.integer)):
+                raise ValueError('t_version must be -1 or an integer in the range 0..7.')
             if t_version != -1:
-                if t_version not in range(8):
+                if t_version not in range(T_VERSION_COUNT):
                     raise ValueError('t_version must be -1 or an integer in the range 0..7.')
                 if params.N != 80 or len(secret_for_check) not in (72, 80):
                     raise ValueError(
                         't_version dataset validation requires N=80 and a '
                         '72- or 80-element secret guess.'
                     )
-                t = np.zeros(8, dtype=int)
+                t = np.zeros(T_VERSION_COUNT, dtype=int)
                 t[t_version] = 1
                 s1_guess = (
                     secret_for_check[8:]
@@ -91,10 +124,40 @@ class EnvDataset(Dataset):
                     else secret_for_check
                 )
                 secret_for_check = np.concatenate([t, s1_guess])
-
-            err = (self.orig_A @ secret_for_check - self.orig_b) % params.Q
-            err[err > params.Q // 2] -= params.Q
-            assert np.std(err) < 2*params.sigma
+                if t_version == T_VERSION_ACTUAL:
+                    err = (self.orig_A @ secret_for_check - self.orig_b) % params.Q
+                    err[err > params.Q // 2] -= params.Q
+                    residual_std = float(np.std(err))
+                    threshold = 2 * params.sigma
+                    if not np.isfinite(residual_std) or residual_std >= threshold:
+                        raise ValueError(
+                            f't-version {t_version} residual validation failed: '
+                            f'std={residual_std:.6f}, threshold={threshold:.6f}.'
+                        )
+                    logger.info(
+                        'Validated correct t-version %d: residual std=%.6f < threshold=%.6f.',
+                        t_version, residual_std, threshold,
+                    )
+                else:
+                    logger.info(
+                        't-version %d is an intentional incorrect hypothesis; '
+                        'skipping correct-secret residual assertion.', t_version,
+                    )
+            else:
+                if len(secret_for_check) != self.orig_A.shape[1]:
+                    raise ValueError(
+                        f'Legacy secret length {len(secret_for_check)} does not match '
+                        f'orig_A columns {self.orig_A.shape[1]}.'
+                    )
+                err = (self.orig_A @ secret_for_check - self.orig_b) % params.Q
+                err[err > params.Q // 2] -= params.Q
+                residual_std = float(np.std(err))
+                threshold = 2 * params.sigma
+                if not np.isfinite(residual_std) or residual_std >= threshold:
+                    raise ValueError(
+                        f'Legacy residual validation failed: std={residual_std:.6f}, '
+                        f'threshold={threshold:.6f}.'
+                    )
 
     def load_chunk(self):
         rng = np.random.RandomState([self.env_base_seed, int(time.time())])
@@ -137,7 +200,7 @@ class EnvDataset(Dataset):
             f"Loaded {len(self.data)} equations from the disk. seekpos {self.seekpos}, nextpos {self.nextpos}"
             )
         if len(self.data) == 0:
-            self.load_chunk()
+            raise RuntimeError(f'No valid equations were loaded from {self.path}.')
 
     def collate_fn(self, elements):
         """

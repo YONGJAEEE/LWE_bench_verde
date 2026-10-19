@@ -64,6 +64,14 @@ class SecretCheck(object):
             self.t = np.zeros(self.T_VERSION_SIZE, dtype=int)
             self.t[self.t_version] = 1
 
+        self.valid_indices = np.arange(
+            self.T_VERSION_SIZE if self.t_version != -1 else 0,
+            self.params.N,
+            dtype=int,
+        )
+        if self.t_version == -1:
+            self.valid_indices = np.arange(self.params.N, dtype=int)
+
         self.guess_log_path = None
         if getattr(self.params, 'dump_path', ''):
             self.guess_log_path = os.path.join(self.params.dump_path, 'guess_log.csv')
@@ -97,6 +105,26 @@ class SecretCheck(object):
                 f'(the 8+72 secret split); got length {len(guess)}.'
             )
         return guess, np.concatenate([self.t, s1_guess])
+
+    def scores_to_full(self, scores):
+        """Return a score vector in model coordinates without inventing t bits."""
+        scores = np.asarray(scores).reshape(-1)
+        if self.t_version == -1:
+            if len(scores) != self.params.N:
+                raise ValueError(
+                    f'Legacy score vector must have length {self.params.N}; got {len(scores)}.'
+                )
+            return scores
+        if len(scores) == self.T_GUESS_SIZE:
+            full = np.zeros(self.params.N, dtype=scores.dtype)
+            full[self.T_VERSION_SIZE:] = scores
+            return full
+        if len(scores) == self.params.N:
+            return scores
+        raise ValueError(
+            f't-version score vector must have length {self.T_GUESS_SIZE} or '
+            f'{self.params.N}; got {len(scores)}.'
+        )
 
     def _log_match(self, guess, full_guess, matched):
         if self.guess_log_path is None:
@@ -149,7 +177,7 @@ class SecretCheck(object):
         and iteratively matches the secret. 
         '''
         self.secret_recovery[method_name] = sorted_idx_with_scores or idx_list
-        guess = np.zeros(self.params.N)
+        guess = np.zeros(self.params.N, dtype=int)
         for i in range(min(self.params.N // 5, len(idx_list))): # sparse assumption
             guess[idx_list[i]] = 1
             logger.info(
@@ -211,7 +239,12 @@ class Evaluator(object):
 
     def ordered_idx_from_scores(self, secret_scores):
         ''' Takes bit-wise scores (length N) and return sorted list<(idx, score)> and sorted list<idx>. '''
-        idx_with_scores = list(enumerate(secret_scores)) # a list of (idx, score)
+        scores = self.secret_check.scores_to_full(secret_scores)
+        idx_with_scores = [
+            (idx, scores[idx])
+            for idx in self.secret_check.valid_indices
+            if np.isfinite(scores[idx])
+        ]
         sorted_idx_by_scores = sorted(idx_with_scores, key=lambda item: item[1], reverse=True) # descending
         return sorted_idx_by_scores, [t[0] for t in sorted_idx_by_scores]
 
@@ -230,19 +263,24 @@ class Evaluator(object):
             self.hybrid_sub([methods_dict[m] for m in combo], ", ".join(combo))
 
     def hybrid_sub(self, methods, combo_name):
-        for results in methods:
-            if max(results) == 0: # the scores are non-negative. Hybrid on this combo is useless. 
-                return None
-
         sum_and_max = np.zeros((4,self.params.N))
         for results in methods:
+            results = self.secret_check.scores_to_full(results)
+            candidate_scores = np.asarray(results[self.secret_check.valid_indices], dtype=float)
+            finite_scores = np.where(np.isfinite(candidate_scores), candidate_scores, 0.0)
+            scale = float(np.max(finite_scores)) if finite_scores.size else 0.0
+            normalized = np.zeros(self.params.N)
+            if scale > 0:
+                normalized[self.secret_check.valid_indices] = finite_scores / scale
+            ranks = np.zeros(self.params.N)
+            if finite_scores.size and np.any(finite_scores != finite_scores[0]):
+                ranks[self.secret_check.valid_indices] = stats.rankdata(finite_scores, method='min')
             # Normalized, sum and max
-            sum_and_max[0] += results/max(results)
-            sum_and_max[1] = np.max((sum_and_max[1], results/max(results)), axis=0)
+            sum_and_max[0] += normalized
+            sum_and_max[1] = np.maximum(sum_and_max[1], normalized)
             # Ranking, sum and max
-            rank = stats.rankdata(results, method='min')
-            sum_and_max[2] += rank
-            sum_and_max[3] = np.max((sum_and_max[3], rank), axis=0)
+            sum_and_max[2] += ranks
+            sum_and_max[3] = np.maximum(sum_and_max[3], ranks)
 
         for i, name in enumerate(['Sum Normalized', 'Max Normalized', 'Sum Rank', 'Max Rank']):
             idx_w_scores, indices = self.ordered_idx_from_scores(sum_and_max[i])
@@ -294,31 +332,45 @@ class Evaluator(object):
         self.direct_results = np.zeros(self.params.N)
         invert = np.vectorize(lambda x: 1 - x)
         logger.info('Starting Direct Method')
+        valid_indices = self.secret_check.valid_indices
 
         for K in np.random.randint(self.params.Q//4, 3*self.params.Q//4, 15):
             logger.info(f'Direct:  K={K}')
-            specialA = np.identity(self.params.N, dtype=np.int64) * K
+            specialA = np.zeros((self.params.N, self.params.N), dtype=np.int64)
+            specialA[valid_indices, valid_indices] = K
             pred_final = self.predict_outputs(specialA, encoder, decoder)
             try:
-                pred_softmax = torch.nn.Softmax(dim=0)(torch.Tensor(pred_final)).detach().cpu().numpy()
-            except:
+                pred_final = self.secret_check.scores_to_full(pred_final).astype(float)
+                logits = np.full(self.params.N, -np.inf, dtype=float)
+                logits[valid_indices] = pred_final[valid_indices]
+                pred_softmax = torch.nn.Softmax(dim=0)(torch.Tensor(logits)).detach().cpu().numpy()
+            except (TypeError, ValueError, RuntimeError):
                 logger.info('Error in softmax prediction, secret decoding failed.')
                 continue
 
             # 3 methods of testing for matching: mean, mode, and softmax mean
-            pred_bin1 = np.vectorize(lambda x: 0 if x > np.mean(pred_final) else 1)(pred_final) 
+            candidate_pred = pred_final[valid_indices]
+            pred_bin1 = np.zeros(self.params.N, dtype=int)
+            pred_bin1[valid_indices] = np.vectorize(
+                lambda x: 0 if x > np.mean(candidate_pred) else 1
+            )(candidate_pred)
             # Do not pass ``keepdims``: older SciPy releases reject that
-            # keyword, while newer releases may return either a scalar or a
-            # one-element array.  Normalizing through ``reshape`` supports
-            # both APIs.
-            mode_value = np.asarray(stats.mode(pred_final).mode).reshape(-1)[0].item()
-            pred_bin2 = np.vectorize(lambda x: 0 if x != mode_value else 1)(pred_final)
-            pred_bin3 = np.vectorize(lambda x: 0 if x > np.mean(pred_softmax) else 1)(pred_softmax)
+            mode_value = np.asarray(stats.mode(candidate_pred).mode).reshape(-1)[0].item()
+            pred_bin2 = np.zeros(self.params.N, dtype=int)
+            pred_bin2[valid_indices] = np.vectorize(
+                lambda x: 0 if x != mode_value else 1
+            )(candidate_pred)
+            pred_bin3 = np.zeros(self.params.N, dtype=int)
+            pred_bin3[valid_indices] = np.vectorize(
+                lambda x: 0 if x > np.mean(pred_softmax[valid_indices]) else 1
+            )(pred_softmax[valid_indices])
 
             # Match list
             for match_vec in [pred_bin1, pred_bin2, pred_bin3]:
                 self.secret_check.match_secret(match_vec, 'Direct')
-                self.secret_check.match_secret(invert(match_vec), 'Direct')
+                inverted = np.zeros(self.params.N, dtype=int)
+                inverted[valid_indices] = invert(match_vec[valid_indices])
+                self.secret_check.match_secret(inverted, 'Direct')
             self.direct_results += pred_softmax
 
         idx_w_scores, indices = self.ordered_idx_from_scores(self.direct_results)
@@ -326,6 +378,7 @@ class Evaluator(object):
     def run_distinguisher(self, encoder, decoder):
         self.distinguisher_results = np.zeros(self.params.N)
         logger.info(f'Starting Distinguisher Method')
+        valid_indices = self.secret_check.valid_indices
         num_samples = self.params.distinguisher_size
         # Get the A (bkz reduced) and run through the model. 
         A_s = np.array(self.iterator.dataset.getbatchA(num_samples))
@@ -335,8 +388,8 @@ class Evaluator(object):
         add_rand = np.random.randint(3*self.params.Q//10, 2*self.params.Q//5, size=num_samples//2)
         add_rand = np.concatenate([add_rand, add_rand*-1])
 
-        lwe_preds = []
-        for i in range(self.params.N):
+        lwe_preds = [lwe_preds0 for _ in range(self.params.N)]
+        for i in valid_indices:
             # Get the A' and run through the model. 
             A_s[:,i] = (A_s[:,i] + add_rand) % self.params.Q # add a random value to the ith coordinate of A
             lwe_preds.append(self.predict_outputs(A_s, encoder, decoder, intermediate=True))
@@ -349,7 +402,7 @@ class Evaluator(object):
         mean_func = 'mean', lambda x,y: np.mean(abs(x-y))
         for func_name, get_diff in [emd_func, mean_func]:
             logger.info(f"Distinguishing 0s using the {func_name}. ")
-            for i in range(self.params.N):
+            for i in valid_indices:
                 self.distinguisher_results[i] = get_diff(lwe_preds[i], lwe_preds0)
             if self.params.secret_type == 'ternary':
                 try:
@@ -432,7 +485,11 @@ class Evaluator(object):
                 threshold = threshold_coeff*mean_scores.mean()
                 stems = torch.where(mean_scores > threshold)[0].numpy()
                 candidates = (stems[(stems!=0)&(stems!=xlen-1)]-1)//self.env.input_encoder.int_len
-                guessed.extend(np.unique(candidates))
+                candidates = np.unique(candidates)
+                guessed.extend(
+                    int(candidate) for candidate in candidates
+                    if int(candidate) in set(self.secret_check.valid_indices)
+                )
                 
         return guessed
 
@@ -466,7 +523,9 @@ class TernaryDistinguisher(object):
         func_name, diff_func = func
         self.func1 = func_name
         logger.info(f"Distinguishing +/-1s using the {func_name}. ")
-        idx_sorted = np.argsort(diffs) # sorted secret indices. Closer to the end means more likely nonzero. 
+        valid_indices = self.secret_check.valid_indices
+        idx_sorted = valid_indices[np.argsort(np.asarray(diffs)[valid_indices])]
+        # sorted secret indices. Closer to the end means more likely nonzero.
         # cheat, just for debugging and logging
         logger.info(f'Real secret: -1: {set(np.where(self.params.secret == -1)[0])}, 1: {set(np.where(self.params.secret == 1)[0])}')
         if set(idx_sorted[-self.params.hamming:]) != set(np.where(self.params.secret != 0)[0]):
