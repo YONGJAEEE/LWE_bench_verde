@@ -65,6 +65,8 @@ sys.path.append(".")
 from src.generate.lllbkz import get_mlwe_circ, centered
 from src.utils import create_this_logger, human, init_rng, mod_mult_torch, read, remove_redundant_rows, shift_negate, shuffled
 
+logger = logging.getLogger(__name__)
+
 
 def get_params():
     """

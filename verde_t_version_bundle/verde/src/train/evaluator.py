@@ -392,7 +392,10 @@ class Evaluator(object):
         for i in valid_indices:
             # Get the A' and run through the model. 
             A_s[:,i] = (A_s[:,i] + add_rand) % self.params.Q # add a random value to the ith coordinate of A
-            lwe_preds.append(self.predict_outputs(A_s, encoder, decoder, intermediate=True))
+            # Keep the prediction aligned with the perturbed coordinate.  An
+            # append here shifts t-version coordinate 8 to list position 80
+            # (and leaves positions 8..79 at the baseline prediction).
+            lwe_preds[i] = self.predict_outputs(A_s, encoder, decoder, intermediate=True)
             A_s[:,i] = (A_s[:,i] - add_rand) % self.params.Q # revert change
 
         # Recover secret. Higher earth mover's distance -> bit nonzero. Higher mean abs diff -> bit nonzero. 
